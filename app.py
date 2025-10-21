@@ -1,7 +1,7 @@
 # Streamlit App: Pipeline TimeLens — Phase 1 MVP
 # -------------------------------------------------------------
 # Upload Salesforce exports (opportunities.csv, stage_history.csv) + optional config.yml.
-# Robust to CSV/TSV delimiters and varied Salesforce headers (aliases).
+# Bulletproof to CSV/TSV delimiters, encodings, and varied Salesforce headers.
 # -------------------------------------------------------------
 
 import io
@@ -18,30 +18,26 @@ except Exception:
     yaml = None
 
 # -------------------------
-# Caching + utilities
+# Caching + robust I/O
 # -------------------------
-
 @st.cache_data(show_spinner=False)
 def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
     """Read CSV/TSV with delimiter + encoding fallbacks."""
     if uploaded_file is None:
         return pd.DataFrame()
 
-    # Always rewind the buffer before each attempt
     def rewind():
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
 
-    # Attempts: (sep=None sniffs comma/tab/semicolon; engine='python' allows sep=None)
     attempts = [
-        dict(sep=None, engine="python", encoding="utf-8"),       # normal UTF-8
-        dict(sep=None, engine="python", encoding="utf-8-sig"),   # BOM-prefixed UTF-8
+        dict(sep=None, engine="python", encoding="utf-8"),       # UTF-8
+        dict(sep=None, engine="python", encoding="utf-8-sig"),   # UTF-8 BOM
         dict(sep=None, engine="python", encoding="cp1252"),      # Windows Western
-        dict(sep=None, engine="python", encoding="latin-1"),     # ISO-8859-1 (very permissive)
+        dict(sep=None, engine="python", encoding="latin-1"),     # ISO-8859-1
     ]
-
     for kw in attempts:
         rewind()
         try:
@@ -49,7 +45,7 @@ def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
         except Exception:
             continue
 
-    # Last-ditch: decode bytes ignoring errors, then parse text
+    # Last resort: ignore decode errors
     rewind()
     try:
         raw = uploaded_file.read()
@@ -59,7 +55,6 @@ def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
     except Exception as e:
         st.error(f"Failed to read file — unsupported encoding/format. Details: {e}")
         return pd.DataFrame()
-
 
 @st.cache_data(show_spinner=False)
 def _read_yaml(uploaded_file: io.BytesIO) -> Dict:
@@ -72,54 +67,65 @@ def _read_yaml(uploaded_file: io.BytesIO) -> Dict:
     return yaml.safe_load(uploaded_file)
 
 @st.cache_data(show_spinner=False)
-def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strong header normalization: strip BOM/nbsp, lower, non-alnum→'_', collapse repeats."""
     if df is None or df.empty:
         return df
+    import re
     out = df.copy()
-    for c in out.columns:
-        if any(k in c.lower() for k in ["date", "time", "at"]):
-            try:
-                out[c] = pd.to_datetime(out[c], errors="coerce")
-            except Exception:
-                pass
-    return out
 
-@st.cache_data(show_spinner=False)
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None:
-        return df
-    out = df.copy()
-    out.columns = [c.strip().replace(" ", "_") for c in out.columns]
+    def clean(c: str) -> str:
+        if not isinstance(c, str):
+            c = str(c)
+        c = c.replace("\ufeff", "")       # BOM
+        c = c.replace("\xa0", " ")        # NBSP -> space
+        c = c.strip().lower()
+        c = re.sub(r"[^a-z0-9]+", "_", c)  # non-alnum -> _
+        c = re.sub(r"_+", "_", c).strip("_")
+        return c
+
+    out.columns = [clean(c) for c in out.columns]
     return out
 
 def rename_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
     """
-    Rename DataFrame columns based on lists of possible aliases per canonical name.
-    Matching is case-insensitive on the alias text (after stripping & lowering).
+    Rename DataFrame columns based on alias lists, using same normalization
+    logic as normalize_columns (lowercase, non-alnum -> _, collapse).
     """
     if df is None or df.empty:
         return df
+    import re
 
     def norm(s: str) -> str:
-        return s.lower().strip()
+        if not isinstance(s, str):
+            s = str(s)
+        s = s.replace("\ufeff", "").replace("\xa0", " ").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s
 
     incoming = {norm(c): c for c in df.columns}  # normalized -> actual
     col_map = {}
 
     for canonical, aliases in mapping.items():
-        for alias in [canonical] + aliases:
-            key = norm(alias)
-            if key in incoming:
-                col_map[incoming[key]] = canonical
-                break
+        canon_norm = norm(canonical)
+        matched = False
+
+        # If the canonical name already exists in normalized form, map it.
+        if canon_norm in incoming:
+            col_map[incoming[canon_norm]] = canonical
+            matched = True
+
+        # Try aliases
+        if not matched:
+            for alias in [canonical] + aliases:
+                alias_norm = norm(alias)
+                if alias_norm in incoming:
+                    col_map[incoming[alias_norm]] = canonical
+                    matched = True
+                    break
 
     return df.rename(columns=col_map)
-
-def require_columns(df: pd.DataFrame, required: List[str], label: str) -> List[str]:
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.error(f"Missing required columns in {label}: {missing}")
-    return missing
 
 # -------------------------
 # Data prep
@@ -153,15 +159,14 @@ def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
 def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
     """
     Returns per-stage durations (days) from historical intervals using either:
-      A) EnteredDate/ExitedDate (or EnteredAt/ExitedAt)
-      B) StartDate/EndDate
-      C) Change log intervals between consecutive ChangeDate rows
+      A) EnteredDate/ExitedDate (or StartDate/EndDate, or EnteredAt/ExitedAt via aliases)
+      B) Change log intervals between consecutive ChangeDate rows (needs OpportunityId, StageName, ChangeDate)
     """
     if stage_history is None or stage_history.empty:
         return pd.DataFrame(columns=["Stage", "duration_days"])
 
     sh = stage_history.copy()
-    # A) Preferred: interval columns
+    # A) Preferred: explicit intervals
     if {"EnteredDate", "ExitedDate"}.issubset(sh.columns):
         sh["start"] = pd.to_datetime(sh["EnteredDate"], errors="coerce")
         sh["end"]   = pd.to_datetime(sh["ExitedDate"], errors="coerce")
@@ -171,7 +176,7 @@ def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
         sh["end"]   = pd.to_datetime(sh["EndDate"], errors="coerce")
         sh["Stage"] = sh.get("StageName", sh.get("Stage", sh.get("ToStage")))
     else:
-        # C) Change log reconstruction
+        # B) Change log reconstruction
         req = {"OpportunityId", "StageName", "ChangeDate"}
         if req.issubset(set(sh.columns)):
             sh = sh.sort_values(["OpportunityId", "ChangeDate"]).copy()
@@ -211,9 +216,11 @@ def sample_stage_durations(stage_list: List[str], samplers: Dict[str, np.ndarray
 # Simulation logic
 # -------------------------
 def get_current_stage(oppty_row: pd.Series, stage_history: pd.DataFrame) -> str:
+    # Prefer explicit current stage on opportunities
     for k in ["CurrentStage", "StageName", "Stage"]:
         if k in oppty_row.index and pd.notna(oppty_row[k]):
             return str(oppty_row[k])
+    # Else try to derive from history (needs OpportunityId)
     if stage_history is None or stage_history.empty or "OpportunityId" not in oppty_row.index:
         return None
     h = stage_history[stage_history["OpportunityId"] == oppty_row["OpportunityId"]]
@@ -347,12 +354,11 @@ def main():
         st.header("Inputs")
         opp_file = st.file_uploader(
             "opportunities.csv", type=["csv", "tsv"],
-            help="Export with OpportunityId, Name, Amount, CloseDate, StageName/CurrentStage"
+            help="Export with OpportunityId/OpportunityName, Amount, CloseDate, StageName"
         )
         sh_file = st.file_uploader(
             "stage_history.csv", type=["csv", "tsv"],
-            help="Export with OpportunityId + either FromStage/ToStage + ChangeDate, "
-                 "or Entered/Exited date columns"
+            help="Either interval columns (Entered/Exited) OR change log (From/To + ChangeDate)"
         )
         cfg_file = st.file_uploader("config.yml (optional)", type=["yml", "yaml"])
         n_sims = st.number_input("Simulations", min_value=200, max_value=20000, value=4000, step=200)
@@ -362,14 +368,14 @@ def main():
         st.info("Upload opportunities and stage history to begin.")
         st.stop()
 
-    # --- Load + normalize + alias map ---
-    opps = normalize_columns(coerce_dates(_read_csv(opp_file)))
-    sh   = normalize_columns(coerce_dates(_read_csv(sh_file)))
+    # --- Load + normalize ---
+    opps = normalize_columns(_read_csv(opp_file))
+    sh   = normalize_columns(_read_csv(sh_file))
 
-    # Canonical -> aliases (handles your EnteredAt/ExitedAt + tabs)
+    # --- Alias mappings (cover your provided headers) ---
     oppty_aliases = {
-        "OpportunityId": ["opportunity id", "opportunity_id", "id"],
-        "Name": ["name", "opportunity name"],
+        "OpportunityId": ["opportunity id", "opportunity_id", "id", "opportunityid"],
+        "Name": ["name", "opportunity name", "opportunityname"],  # <-- maps OpportunityName -> Name
         "Amount": ["amount", "amount usd", "amount ($)"],
         "CloseDate": ["close date", "closedate"],
         "StageName": ["stage", "stage name", "current stage"],
@@ -378,13 +384,13 @@ def main():
         "CreatedDate": ["created date", "createddate"],
     }
     stage_aliases = {
-        "OpportunityId": ["opportunity id", "opportunity_id", "id"],
+        "OpportunityId": ["opportunity id", "opportunity_id", "id", "opportunityid"],
         "FromStage": ["from stage", "from_stage", "old value", "prior stage"],
         "ToStage": ["to stage", "to_stage", "new value", "next stage"],
         "ChangeDate": ["change date", "changedate", "last modified date", "date/time", "modified date"],
-        # interval-style headers (your file uses these)
+        # interval-style headers (handles EnteredAt/ExitedAt)
         "EnteredDate": ["entered date", "entereddate", "start date", "startdate", "enteredat", "entered_at"],
-        "ExitedDate":  ["exited date", "exiteddate", "end date", "enddate", "exitedat", "exited_at"],
+        "ExitedDate":  ["exited date",  "exiteddate",  "end date",   "enddate",   "exitedat",  "exited_at"],
         "StageName": ["stage", "stage name"],
         "StartDate": ["start date", "startdate"],
         "EndDate": ["end date", "enddate"],
@@ -393,17 +399,33 @@ def main():
     opps = rename_columns(opps, oppty_aliases)
     sh   = rename_columns(sh, stage_aliases)
 
-    # Minimal required keys
-    missing_a = require_columns(opps, ["OpportunityId"], "opportunities.csv")
-    missing_b = require_columns(sh,   ["OpportunityId"], "stage_history.csv")
-    if missing_a or missing_b:
+    # --- Key requirement for opportunities ---
+    if "OpportunityId" not in opps.columns:
+        # Fallback: create a stable surrogate key from Name + CreatedDate
+        if "Name" in opps.columns:
+            seed = opps["Name"].astype(str) + "|" + opps.get("CreatedDate", pd.Series([""], index=opps.index)).astype(str)
+            opps["OpportunityId"] = pd.util.hash_pandas_object(seed, index=False).astype(str)
+            st.warning("No OpportunityId in opportunities.csv — generated a surrogate ID from Name + CreatedDate.")
+        else:
+            st.error("Missing required columns in opportunities.csv: ['OpportunityId'] (or include 'Name' so we can generate a surrogate).")
+            st.stop()
+
+    # --- Stage history requirements (interval OR change log) ---
+    has_interval = {"EnteredDate", "ExitedDate"}.issubset(sh.columns) or {"StartDate", "EndDate"}.issubset(sh.columns)
+    has_changelog = {"FromStage", "ToStage", "ChangeDate"}.issubset(sh.columns)
+    if not (has_interval or has_changelog):
+        st.error(
+            "stage_history.csv must include either:\n"
+            "  • EnteredDate & ExitedDate (or StartDate & EndDate)\n"
+            "  • OR FromStage, ToStage & ChangeDate"
+        )
         st.stop()
 
     # Standardize CloseDate if present
     if "CloseDate" in opps.columns:
         opps["CloseDate"] = pd.to_datetime(opps["CloseDate"], errors="coerce")
 
-    # --- Config (stage order override) ---
+    # --- Config (optional stage order override) ---
     config = {}
     if cfg_file is not None:
         try:
@@ -412,30 +434,34 @@ def main():
             st.warning(f"Failed to read config: {e}")
 
     stage_order = config.get("stage_order") or infer_stage_order(
-        sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage"})
+        sh.rename(columns={"from_stage": "FromStage", "to_stage": "ToStage"})
     )
     if not stage_order:
-        st.error("Couldn't determine stage order. Provide config.yml with stage_order or ensure stage_history has FromStage/ToStage and ChangeDate, or Entered/Exited dates.")
+        st.error("Couldn't determine stage order. Provide config.yml with stage_order or ensure stage_history has intervals or From/To/ChangeDate.")
         st.stop()
 
     st.write("**Stage order:**", " → ".join(stage_order))
 
     # --- Build duration samplers ---
     durations = compute_stage_durations(
-        sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage", "Stage": "StageName"})
+        sh.rename(columns={"from_stage": "FromStage", "to_stage": "ToStage", "stage": "StageName"})
     )
     samplers = build_empirical_samplers(durations)
     if not samplers:
         st.warning("No historical stage durations available; using fallback days for all stages.")
 
-    # Open opportunity filter
+    # --- Open opportunity filter ---
     if "IsClosed" in opps.columns:
         ic = opps["IsClosed"]
         if ic.dtype == object:
             opps["IsClosed"] = ic.astype(str).str.lower().isin(["true", "t", "1", "yes", "y"])
         opps_open = opps[~opps["IsClosed"].astype(bool)].copy()
     else:
-        opps_open = opps.copy()
+        # No IsClosed column: assume all open, but defensively exclude stages starting with "Closed"
+        if "StageName" in opps.columns:
+            opps_open = opps[~opps["StageName"].astype(str).str.lower().str.startswith("closed")].copy()
+        else:
+            opps_open = opps.copy()
 
     st.subheader("Simulation")
     sim_summary, per_opp_samples = simulate_close_dates(opps_open, sh, stage_order, samplers, int(n_sims))
