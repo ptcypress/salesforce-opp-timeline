@@ -402,19 +402,19 @@ def main():
     # --- Key requirement for opportunities ---
     if "OpportunityId" not in opps.columns:
     # Fallback: create a stable surrogate key from Name + CreatedDate (or empty if missing)
-    if "Name" in opps.columns:
-        if "CreatedDate" in opps.columns:
-            created = opps["CreatedDate"].astype(str)
-        else:
-            # make an empty Series aligned to opps.index (correct length)
-            created = pd.Series("", index=opps.index, dtype=str)
+        if "Name" in opps.columns:
+            if "CreatedDate" in opps.columns:
+                created = opps["CreatedDate"].astype(str)
+            else:
+                # make an empty Series aligned to opps.index (correct length)
+                created = pd.Series("", index=opps.index, dtype=str)
 
-        seed = opps["Name"].astype(str) + "|" + created
-        opps["OpportunityId"] = pd.util.hash_pandas_object(seed, index=False).astype(str)
-        st.warning("No OpportunityId in opportunities.csv — generated a surrogate ID from Name + CreatedDate.")
-    else:
-        st.error("Missing required columns in opportunities.csv: ['OpportunityId'] (or include 'Name' so we can generate a surrogate).")
-        st.stop()
+            seed = opps["Name"].astype(str) + "|" + created
+            opps["OpportunityId"] = pd.util.hash_pandas_object(seed, index=False).astype(str)
+            st.warning("No OpportunityId in opportunities.csv — generated a surrogate ID from Name + CreatedDate.")
+        else:
+            st.error("Missing required columns in opportunities.csv: ['OpportunityId'] (or include 'Name' so we can generate a surrogate).")
+            st.stop()
 
 
     # --- Stage history requirements (interval OR change log) ---
