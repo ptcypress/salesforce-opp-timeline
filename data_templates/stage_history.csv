@@ -1,1 +1,15 @@
+OpportunityId,FromStage,ToStage,EnteredAt,ExitedAt,StageOwner,Notes
+006xx00000A1B2C,,Drawing Info,2025-07-02 09:14:00,2025-07-05 16:30:00,Kris D.,Created opp
+006xx00000A1B2C,Drawing Info,Customer Req,2025-07-05 16:30:00,2025-07-09 10:00:00,Kris D.,Requirements received
+006xx00000A1B2C,Customer Req,Drawing Gen,2025-07-09 10:00:00,2025-07-15 15:20:00,Charlie P.,
+006xx00000A1B2C,Drawing Gen,Drawing Check,2025-07-15 15:20:00,2025-07-17 17:45:00,QA Team,
+006xx00000A1B2C,Drawing Check,Customer Dwg Check,2025-07-17 17:45:00,2025-07-23 09:30:00,Sales,
+006xx00000A1B2C,Customer Dwg Check,Prototyping,2025-07-23 09:30:00,2025-08-06 13:00:00,NPD,PO recvd
+006xx00000A1B2D,,Drawing Info,2025-08-21 14:05:00,2025-08-23 12:00:00,Sales,
+006xx00000A1B2D,Drawing Info,Customer Req,2025-08-23 12:00:00,2025-08-28 09:00:00,Sales,
+006xx00000A1B2D,Customer Req,Drawing Gen,2025-08-28 09:00:00,2025-09-09 18:00:00,Engineering,
+006xx00000A1B2D,Drawing Gen,Customer Req,2025-09-09 18:00:00,2025-09-12 10:00:00,Sales,Scope refined
+006xx00000A1B2D,Customer Req,Drawing Gen,2025-09-12 10:00:00,2025-09-18 16:30:00,Engineering,Rev B
+006xx00000A1B2D,Drawing Gen,DFM DFA,2025-09-18 16:30:00,2025-09-25 17:10:00,Eng Mfg,
+006xx00000A1B2D,DFM DFA,Customer Commitment,2025-09-25 17:10:00,2025-10-05 13:20:00,Sales,Verbal commit
 
