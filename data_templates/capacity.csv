@@ -1,1 +1,7 @@
+Stage, Team, WeeklyCapacity_hrs, Notes,
+Drawing Gen,	Engineering,	120,	3 FTE x 40 hrs x 0.75 avail
+Drawing Check,	QA,	40,	1 FTE
+Prototyping,	NPD,	80,	Rig time shared
+DFM DFA,	Eng Mfg,	60	
+ECR Creation,	Eng Mfg,	24	
 
