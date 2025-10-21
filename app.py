@@ -17,6 +17,112 @@ try:
 except Exception:
     yaml = None
 
+def _coalesce_first(df: pd.DataFrame, names: list[str]) -> str | None:
+    """Return the first name that exists in df.columns, else None."""
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+def _parse_dt(s: pd.Series) -> pd.Series:
+    # Robust datetime parse (handles both date and datetime, blanks, etc.)
+    return pd.to_datetime(s, errors="coerce", infer_datetime_format=True, utc=False)
+
+def normalize_stage_history(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.copy()
+
+    # Trim whitespace in column names
+    df.columns = [c.strip() for c in df.columns]
+
+    # 1) Friendly renames (exact matches)
+    rename_map = {
+        "From Stage": "FromStage",
+        "To Stage": "ToStage",
+        "Last Modified": "EnteredDate",   # your export: start of the *to* stage window
+        "Close Date": "ExitedDate",       # your export: end of the *from* stage window
+        "Stage Duration": "StageDuration",
+        "Owner": "StageOwner",
+        "Opportunity Name": "OpportunityName",
+        "Opportunity Close Date": "OpportunityCloseDate",
+        "Opportunity Record Type": "OpportunityRecordType",
+        # Salesforce StageHistory fields (sometimes appear)
+        "OldValue": "FromStage",
+        "NewValue": "ToStage",
+        "CreatedDate": "ChangeDate",
+    }
+    df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
+
+    # 2) Identify which format we have and manufacture canonical fields
+    # --- Case A: already interval-like
+    entered_col = _coalesce_first(df, ["EnteredDate", "StartDate", "Start", "Entered At", "EnteredAt"])
+    exited_col  = _coalesce_first(df, ["ExitedDate", "EndDate", "End", "Exited At", "ExitedAt"])
+
+    # --- Case B: transition-like (we’ll build Entered/Exited from ChangeDate by pairing rows)
+    change_col  = _coalesce_first(df, ["ChangeDate", "ChangedDate", "StageChangeDate"])
+
+    # If it's your export, the earlier rename already set EnteredDate/ExitedDate.
+    # Convert any datetime-like columns we recognize.
+    for c in [entered_col, exited_col, change_col, "OpportunityCloseDate"]:
+        if c and c in df.columns:
+            df[c] = _parse_dt(df[c])
+
+    # 3) If we only have ChangeDate with From/To, construct intervals by grouping per opportunity
+    if (entered_col is None or exited_col is None) and change_col and {"FromStage", "ToStage"}.issubset(df.columns):
+        # We need an ordering key. If OpportunityId not present, fallback to OpportunityName.
+        opp_key = _coalesce_first(df, ["OpportunityId", "Opportunity Name", "OpportunityName"])
+        if opp_key is None:
+            # Single-stream fallback: treat whole file as one sequence
+            opp_key = "__ONE__"
+            df[opp_key] = "ALL"
+
+        # Order by opp + ChangeDate
+        df = df.sort_values([opp_key, change_col]).copy()
+
+        # Entered = current ChangeDate; Exited = next row’s ChangeDate within same opp
+        df["EnteredDate"] = df[change_col]
+        df["ExitedDate"]  = df.groupby(opp_key)["EnteredDate"].shift(-1)
+
+        # If last stage has no ExitedDate, leave NaT (open/current)
+        entered_col, exited_col = "EnteredDate", "ExitedDate"
+
+    # 4) Validate minimum required fields
+    have_min_interval = (entered_col is not None) and (exited_col is not None)
+    have_min_transition = {"FromStage", "ToStage", (change_col or "ChangeDate")}.issubset(set(df.columns))
+
+    if not have_min_interval and not have_min_transition:
+        raise ValueError(
+            "stage_history.csv must include either:\n"
+            " • EnteredDate & ExitedDate (or StartDate & EndDate)\n"
+            " • OR FromStage, ToStage & ChangeDate\n"
+            "Your file columns: " + ", ".join(df.columns)
+        )
+
+    # 5) Final canonical columns
+    # If we constructed Entered/Exited, ensure datetime and compute duration if missing
+    if entered_col and exited_col:
+        df["EnteredDate"] = _parse_dt(df[entered_col])
+        df["ExitedDate"]  = _parse_dt(df[exited_col])
+
+    # Standardize optional identifiers/owner
+    if "OpportunityId" not in df.columns:
+        alt = _coalesce_first(df, ["Opportunity Name", "OpportunityName"])
+        if alt:
+            df.rename(columns={alt: "OpportunityId"}, inplace=True)
+        else:
+            # fabricate a stable ID from name+first timestamp if absolutely needed
+            seed = (
+                df.get("OpportunityName", pd.Series([""], index=df.index)).astype(str)
+                + "|" + df.get("EnteredDate", pd.Series([""], index=df.index)).astype(str)
+            )
+            df["OpportunityId"] = pd.util.hash_pandas_object(seed, index=False).astype(str)
+
+    if "StageOwner" not in df.columns and "Owner" in raw.columns:
+        df["StageOwner"] = raw["Owner"]
+
+    # Keep a tidy set of columns (don’t drop extras; just order the important ones first)
+    front_cols = ["OpportunityId", "FromStage", "ToStage", "EnteredDate", "ExitedDate", "StageOwner"]
+    ordered = [c for c in front_cols if c in df.columns] + [c for c in df.columns if c not in front_cols]
+    return df[ordered]
 # -------------------------
 # Caching + robust I/O
 # -------------------------
