@@ -1,1 +1,64 @@
 
+# App configuration for Pipeline TimeLens
+timezone: America/New_York
+currency: USD
+
+stages:
+  # Ordered list (top to bottom = early -> late). Names must match your Salesforce stage names.
+  - Drawing Info
+  - Customer Req
+  - Drawing Gen
+  - Drawing Check
+  - Customer Dwg Check
+  - Prototyping
+  - DFM DFA
+  - Customer Commitment
+  - ECR Creation
+  - Tool Build
+  - Trial Runs
+  - Customer Sample Check
+  - Drawing Clean up
+  - GP Update
+  - Product Validation
+  - BOM Check & Vault
+  - Activation
+  - Pilot Launch (Limited Launch)
+  - Closed Won
+  - Closed Lost
+
+required_stages:
+  # Stages that every opportunity should pass through (others may be skipped).
+  - Drawing Info
+  - Customer Req
+  - Drawing Gen
+  - Prototyping
+  - Customer Commitment
+
+regressions_allowed:
+  # Pairs that indicate allowed backwards moves (rework). Used to learn loop probabilities.
+  - [Drawing Gen, Customer Req]
+  - [Drawing Check, Drawing Gen]
+  - [Customer Dwg Check, Drawing Gen]
+
+parallelizable:
+  # Stages that can overlap (if your process supports it). Otherwise, app assumes sequential.
+  - Drawing Clean up
+  - GP Update
+
+distributions:
+  # Per-stage parametric preference; fallback to ECDF if not set or fit fails.
+  # Options: ecdf, lognormal, gamma, weibull
+  default: ecdf
+  overrides:
+    Drawing Gen: lognormal
+    Prototyping: gamma
+
+sla_overrides:
+  # Optional fixed SLA days for certain stages to model improvements or agreements.
+  # Example: 'Legal Review': 5
+  {}
+
+capacity:
+  # Toggle capacity modeling. If true, capacity.csv should be provided.
+  enabled: true
+
