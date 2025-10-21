@@ -1,11 +1,7 @@
 # Streamlit App: Pipeline TimeLens — Phase 1 MVP
 # -------------------------------------------------------------
 # Upload Salesforce exports (opportunities.csv, stage_history.csv) + optional config.yml.
-# The app:
-#   1) Normalizes + aliases column names from varied Salesforce exports
-#   2) Fits empirical per-stage duration distributions
-#   3) Runs Monte Carlo to forecast remaining time to close per opportunity
-#   4) Shows per-opportunity P10–P90 windows + portfolio $-weighted close curve
+# Robust to CSV/TSV delimiters and varied Salesforce headers (aliases).
 # -------------------------------------------------------------
 
 import io
@@ -26,12 +22,33 @@ except Exception:
 # -------------------------
 @st.cache_data(show_spinner=False)
 def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
-    return pd.read_csv(uploaded_file)
+    """Read CSV/TSV with automatic delimiter detection."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    # Reset pointer each read (Streamlit may reuse BytesIO)
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    try:
+        # engine='python' + sep=None lets pandas sniff commas, tabs, semicolons, etc.
+        return pd.read_csv(uploaded_file, sep=None, engine="python")
+    except Exception:
+        # Fallback to standard comma
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        return pd.read_csv(uploaded_file)
 
 @st.cache_data(show_spinner=False)
 def _read_yaml(uploaded_file: io.BytesIO) -> Dict:
-    if yaml is None:
+    if yaml is None or uploaded_file is None:
         return {}
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
     return yaml.safe_load(uploaded_file)
 
 @st.cache_data(show_spinner=False)
@@ -58,30 +75,27 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def rename_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
     """
     Rename DataFrame columns based on lists of possible aliases per canonical name.
-    Matches are case-insensitive and expect exact header matches (ignoring case/underscores/spaces).
+    Matching is case-insensitive on the alias text (after stripping & lowering).
     """
     if df is None or df.empty:
         return df
 
-    # Build a normalized lookup for incoming df columns (lowercased)
     def norm(s: str) -> str:
         return s.lower().strip()
 
-    incoming = {norm(c): c for c in df.columns}  # map normalized -> actual
+    incoming = {norm(c): c for c in df.columns}  # normalized -> actual
     col_map = {}
 
     for canonical, aliases in mapping.items():
-        # canonical itself should also be considered as an alias
         for alias in [canonical] + aliases:
             key = norm(alias)
             if key in incoming:
                 col_map[incoming[key]] = canonical
-                break  # stop at first match for this canonical name
+                break
 
     return df.rename(columns=col_map)
 
 def require_columns(df: pd.DataFrame, required: List[str], label: str) -> List[str]:
-    """Return list of missing required columns for a given frame/label."""
     missing = [c for c in required if c not in df.columns]
     if missing:
         st.error(f"Missing required columns in {label}: {missing}")
@@ -93,7 +107,6 @@ def require_columns(df: pd.DataFrame, required: List[str], label: str) -> List[s
 def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
     if stage_history is None or stage_history.empty:
         return []
-    # Count transitions and greedily assemble the most common path
     order = (
         stage_history
         .dropna(subset=["FromStage", "ToStage"])
@@ -120,7 +133,7 @@ def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
 def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
     """
     Returns per-stage durations (days) from historical intervals using either:
-      A) EnteredDate/ExitedDate
+      A) EnteredDate/ExitedDate (or EnteredAt/ExitedAt)
       B) StartDate/EndDate
       C) Change log intervals between consecutive ChangeDate rows
     """
@@ -128,6 +141,7 @@ def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Stage", "duration_days"])
 
     sh = stage_history.copy()
+    # A) Preferred: interval columns
     if {"EnteredDate", "ExitedDate"}.issubset(sh.columns):
         sh["start"] = pd.to_datetime(sh["EnteredDate"], errors="coerce")
         sh["end"]   = pd.to_datetime(sh["ExitedDate"], errors="coerce")
@@ -137,6 +151,7 @@ def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
         sh["end"]   = pd.to_datetime(sh["EndDate"], errors="coerce")
         sh["Stage"] = sh.get("StageName", sh.get("Stage", sh.get("ToStage")))
     else:
+        # C) Change log reconstruction
         req = {"OpportunityId", "StageName", "ChangeDate"}
         if req.issubset(set(sh.columns)):
             sh = sh.sort_values(["OpportunityId", "ChangeDate"]).copy()
@@ -148,7 +163,7 @@ def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
 
     sh = sh.dropna(subset=["start", "end", "Stage"]).copy()
     sh["duration_days"] = (sh["end"] - sh["start"]).dt.total_seconds() / 86400.0
-    sh = sh[(sh["duration_days"] >= 0) & (sh["duration_days"] < 3650)]  # guardrails
+    sh = sh[(sh["duration_days"] >= 0) & (sh["duration_days"] < 3650)]
     return sh[["Stage", "duration_days"]].reset_index(drop=True)
 
 def build_empirical_samplers(durations: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -242,13 +257,10 @@ def gantt_card(row: pd.Series) -> go.Figure:
     p50 = today + pd.Timedelta(days=float(row["days_p50"]))
     p90 = today + pd.Timedelta(days=float(row["days_p90"]))
 
-    # P10–P90 window
     fig.add_trace(go.Scatter(
         x=[p10, p90], y=[row["Name"], row["Name"]],
         mode="lines", line=dict(width=10), name="P10–P90"
     ))
-
-    # Median marker (use safe literal for Plotly %{...} inside Python strings)
     fig.add_trace(go.Scatter(
         x=[p50, p50], y=[row["Name"], row["Name"]],
         mode="lines", line=dict(width=6, dash="dash"), name="Median",
@@ -314,12 +326,13 @@ def main():
     with st.sidebar:
         st.header("Inputs")
         opp_file = st.file_uploader(
-            "opportunities.csv", type=["csv"],
+            "opportunities.csv", type=["csv", "tsv"],
             help="Export with OpportunityId, Name, Amount, CloseDate, StageName/CurrentStage"
         )
         sh_file = st.file_uploader(
-            "stage_history.csv", type=["csv"],
-            help="Export with OpportunityId, FromStage, ToStage, and ChangeDate or Entered/Exited"
+            "stage_history.csv", type=["csv", "tsv"],
+            help="Export with OpportunityId + either FromStage/ToStage + ChangeDate, "
+                 "or Entered/Exited date columns"
         )
         cfg_file = st.file_uploader("config.yml (optional)", type=["yml", "yaml"])
         n_sims = st.number_input("Simulations", min_value=200, max_value=20000, value=4000, step=200)
@@ -333,7 +346,7 @@ def main():
     opps = normalize_columns(coerce_dates(_read_csv(opp_file)))
     sh   = normalize_columns(coerce_dates(_read_csv(sh_file)))
 
-    # Canonical -> aliases that might show up in Salesforce exports
+    # Canonical -> aliases (handles your EnteredAt/ExitedAt + tabs)
     oppty_aliases = {
         "OpportunityId": ["opportunity id", "opportunity_id", "id"],
         "Name": ["name", "opportunity name"],
@@ -346,12 +359,12 @@ def main():
     }
     stage_aliases = {
         "OpportunityId": ["opportunity id", "opportunity_id", "id"],
-        "FromStage": ["from stage", "from_stage", "prior stage"],
-        "ToStage": ["to stage", "to_stage", "new stage", "next stage"],
-        "ChangeDate": ["change date", "changedate", "date/time", "modified date"],
-        # optional alternates:
-        "EnteredDate": ["entered date", "entereddate", "start date", "startdate"],
-        "ExitedDate": ["exited date", "exiteddate", "end date", "enddate"],
+        "FromStage": ["from stage", "from_stage", "old value", "prior stage"],
+        "ToStage": ["to stage", "to_stage", "new value", "next stage"],
+        "ChangeDate": ["change date", "changedate", "last modified date", "date/time", "modified date"],
+        # interval-style headers (your file uses these)
+        "EnteredDate": ["entered date", "entereddate", "start date", "startdate", "enteredat", "entered_at"],
+        "ExitedDate":  ["exited date", "exiteddate", "end date", "enddate", "exitedat", "exited_at"],
         "StageName": ["stage", "stage name"],
         "StartDate": ["start date", "startdate"],
         "EndDate": ["end date", "enddate"],
@@ -360,13 +373,13 @@ def main():
     opps = rename_columns(opps, oppty_aliases)
     sh   = rename_columns(sh, stage_aliases)
 
-    # Minimal required columns
+    # Minimal required keys
     missing_a = require_columns(opps, ["OpportunityId"], "opportunities.csv")
     missing_b = require_columns(sh,   ["OpportunityId"], "stage_history.csv")
     if missing_a or missing_b:
         st.stop()
 
-    # Optional CloseDate parsing standardization if provided
+    # Standardize CloseDate if present
     if "CloseDate" in opps.columns:
         opps["CloseDate"] = pd.to_datetime(opps["CloseDate"], errors="coerce")
 
@@ -382,7 +395,7 @@ def main():
         sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage"})
     )
     if not stage_order:
-        st.error("Couldn't determine stage order. Provide config.yml with stage_order or ensure stage_history has FromStage/ToStage and ChangeDate.")
+        st.error("Couldn't determine stage order. Provide config.yml with stage_order or ensure stage_history has FromStage/ToStage and ChangeDate, or Entered/Exited dates.")
         st.stop()
 
     st.write("**Stage order:**", " → ".join(stage_order))
@@ -395,9 +408,8 @@ def main():
     if not samplers:
         st.warning("No historical stage durations available; using fallback days for all stages.")
 
-    # Open opp filter (if provided)
+    # Open opportunity filter
     if "IsClosed" in opps.columns:
-        # Try robust boolean conversion
         ic = opps["IsClosed"]
         if ic.dtype == object:
             opps["IsClosed"] = ic.astype(str).str.lower().isin(["true", "t", "1", "yes", "y"])
@@ -420,7 +432,6 @@ def main():
         use_container_width=True
     )
 
-    # Tabs
     tab1, tab2 = st.tabs(["Opportunity view", "Portfolio view"])
 
     with tab1:
