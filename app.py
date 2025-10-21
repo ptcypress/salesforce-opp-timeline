@@ -1,15 +1,14 @@
-# Streamlit App: Pipeline TimeLens — Phase 1 MVP (fixed hovertemplate issues)
+# Streamlit App: Pipeline TimeLens — Phase 1 MVP
 # -------------------------------------------------------------
-# Features
-# - Upload Salesforce exports (opportunities.csv, stage_history.csv) + config.yml (optional)
-# - Compute per-stage duration distributions from historical stage intervals (ECDF-based)
-# - Monte Carlo simulation of remaining stages for each open opportunity
-# - Opportunity view: timeline with P10–P90 bands and median, probability to hit target date
-# - Portfolio view: distribution of close dates ($-weighted) and cumulative close curve with P10/P50/P90
+# Upload Salesforce exports (opportunities.csv, stage_history.csv) + optional config.yml.
+# The app:
+#   1) Normalizes + aliases column names from varied Salesforce exports
+#   2) Fits empirical per-stage duration distributions
+#   3) Runs Monte Carlo to forecast remaining time to close per opportunity
+#   4) Shows per-opportunity P10–P90 windows + portfolio $-weighted close curve
 # -------------------------------------------------------------
 
 import io
-from datetime import datetime
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -22,21 +21,18 @@ try:
 except Exception:
     yaml = None
 
-
 # -------------------------
-# Utility helpers
+# Caching + utilities
 # -------------------------
 @st.cache_data(show_spinner=False)
 def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
-
 
 @st.cache_data(show_spinner=False)
 def _read_yaml(uploaded_file: io.BytesIO) -> Dict:
     if yaml is None:
         return {}
     return yaml.safe_load(uploaded_file)
-
 
 @st.cache_data(show_spinner=False)
 def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -51,7 +47,6 @@ def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
                 pass
     return out
 
-
 @st.cache_data(show_spinner=False)
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
@@ -60,15 +55,47 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out.columns = [c.strip().replace(" ", "_") for c in out.columns]
     return out
 
+def rename_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    Rename DataFrame columns based on lists of possible aliases per canonical name.
+    Matches are case-insensitive and expect exact header matches (ignoring case/underscores/spaces).
+    """
+    if df is None or df.empty:
+        return df
+
+    # Build a normalized lookup for incoming df columns (lowercased)
+    def norm(s: str) -> str:
+        return s.lower().strip()
+
+    incoming = {norm(c): c for c in df.columns}  # map normalized -> actual
+    col_map = {}
+
+    for canonical, aliases in mapping.items():
+        # canonical itself should also be considered as an alias
+        for alias in [canonical] + aliases:
+            key = norm(alias)
+            if key in incoming:
+                col_map[incoming[key]] = canonical
+                break  # stop at first match for this canonical name
+
+    return df.rename(columns=col_map)
+
+def require_columns(df: pd.DataFrame, required: List[str], label: str) -> List[str]:
+    """Return list of missing required columns for a given frame/label."""
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns in {label}: {missing}")
+    return missing
 
 # -------------------------
-# Data preparation
+# Data prep
 # -------------------------
 def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
     if stage_history is None or stage_history.empty:
         return []
+    # Count transitions and greedily assemble the most common path
     order = (
-        stage_history.assign(next_stage=lambda d: d.groupby("OpportunityId")["ToStage"].shift(-1))
+        stage_history
         .dropna(subset=["FromStage", "ToStage"])
         .value_counts(["FromStage", "ToStage"])
         .reset_index(name="n")
@@ -80,7 +107,8 @@ def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
     seen = {current}
     sequence = [current]
     while True:
-        nxt = order.query("FromStage == @current").sort_values("n", ascending=False)["ToStage"].tolist()
+        nxt = (order.query("FromStage == @current")
+                     .sort_values("n", ascending=False)["ToStage"].tolist())
         nxt = [s for s in nxt if s not in seen]
         if not nxt:
             break
@@ -89,35 +117,39 @@ def infer_stage_order(stage_history: pd.DataFrame) -> List[str]:
         seen.add(current)
     return sequence
 
-
 def compute_stage_durations(stage_history: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns per-stage durations (days) from historical intervals using either:
+      A) EnteredDate/ExitedDate
+      B) StartDate/EndDate
+      C) Change log intervals between consecutive ChangeDate rows
+    """
     if stage_history is None or stage_history.empty:
         return pd.DataFrame(columns=["Stage", "duration_days"])
 
     sh = stage_history.copy()
     if {"EnteredDate", "ExitedDate"}.issubset(sh.columns):
         sh["start"] = pd.to_datetime(sh["EnteredDate"], errors="coerce")
-        sh["end"] = pd.to_datetime(sh["ExitedDate"], errors="coerce")
+        sh["end"]   = pd.to_datetime(sh["ExitedDate"], errors="coerce")
         sh["Stage"] = sh.get("StageName", sh.get("Stage", sh.get("ToStage")))
     elif {"StartDate", "EndDate"}.issubset(sh.columns):
         sh["start"] = pd.to_datetime(sh["StartDate"], errors="coerce")
-        sh["end"] = pd.to_datetime(sh["EndDate"], errors="coerce")
+        sh["end"]   = pd.to_datetime(sh["EndDate"], errors="coerce")
         sh["Stage"] = sh.get("StageName", sh.get("Stage", sh.get("ToStage")))
     else:
         req = {"OpportunityId", "StageName", "ChangeDate"}
         if req.issubset(set(sh.columns)):
             sh = sh.sort_values(["OpportunityId", "ChangeDate"]).copy()
             sh["start"] = sh.groupby("OpportunityId")["ChangeDate"].shift(0)
-            sh["end"] = sh.groupby("OpportunityId")["ChangeDate"].shift(-1)
+            sh["end"]   = sh.groupby("OpportunityId")["ChangeDate"].shift(-1)
             sh["Stage"] = sh["StageName"]
         else:
             return pd.DataFrame(columns=["Stage", "duration_days"])
 
     sh = sh.dropna(subset=["start", "end", "Stage"]).copy()
     sh["duration_days"] = (sh["end"] - sh["start"]).dt.total_seconds() / 86400.0
-    sh = sh[(sh["duration_days"] >= 0) & (sh["duration_days"] < 3650)]
+    sh = sh[(sh["duration_days"] >= 0) & (sh["duration_days"] < 3650)]  # guardrails
     return sh[["Stage", "duration_days"]].reset_index(drop=True)
-
 
 def build_empirical_samplers(durations: pd.DataFrame) -> Dict[str, np.ndarray]:
     samplers = {}
@@ -129,20 +161,16 @@ def build_empirical_samplers(durations: pd.DataFrame) -> Dict[str, np.ndarray]:
             samplers[stage] = vals
     return samplers
 
-
-def sample_stage_durations(stage_list: List[str], samplers: Dict[str, np.ndarray], n: int, fallback_days: float = 7.0) -> np.ndarray:
+def sample_stage_durations(stage_list: List[str], samplers: Dict[str, np.ndarray],
+                           n: int, fallback_days: float = 7.0) -> np.ndarray:
     if len(stage_list) == 0:
         return np.zeros((n, 0))
     out = np.zeros((n, len(stage_list)), dtype=float)
     rng = np.random.default_rng(42)
     for j, s in enumerate(stage_list):
         arr = samplers.get(s)
-        if arr is None or len(arr) == 0:
-            out[:, j] = fallback_days
-        else:
-            out[:, j] = rng.choice(arr, size=n, replace=True)
+        out[:, j] = fallback_days if (arr is None or len(arr) == 0) else rng.choice(arr, size=n, replace=True)
     return out
-
 
 # -------------------------
 # Simulation logic
@@ -151,26 +179,22 @@ def get_current_stage(oppty_row: pd.Series, stage_history: pd.DataFrame) -> str:
     for k in ["CurrentStage", "StageName", "Stage"]:
         if k in oppty_row.index and pd.notna(oppty_row[k]):
             return str(oppty_row[k])
-    if stage_history is None or stage_history.empty:
+    if stage_history is None or stage_history.empty or "OpportunityId" not in oppty_row.index:
         return None
     h = stage_history[stage_history["OpportunityId"] == oppty_row["OpportunityId"]]
-    if "ChangeDate" in h.columns and "ToStage" in h.columns:
+    if {"ChangeDate", "ToStage"}.issubset(h.columns) and not h.empty:
         h = h.sort_values("ChangeDate")
-        if not h.empty:
-            return str(h.iloc[-1]["ToStage"])
+        return str(h.iloc[-1]["ToStage"])
     return None
 
-
 def remaining_stages(current: str, stage_order: List[str]) -> List[str]:
-    if not current or not stage_order:
-        return []
-    if current not in stage_order:
+    if not current or not stage_order or (current not in stage_order):
         return []
     idx = stage_order.index(current)
     return stage_order[idx + 1 :]
 
-
-def simulate_close_dates(opps: pd.DataFrame, stage_history: pd.DataFrame, stage_order: List[str], samplers: Dict[str, np.ndarray], n_sims: int = 2000) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
+def simulate_close_dates(opps: pd.DataFrame, stage_history: pd.DataFrame, stage_order: List[str],
+                         samplers: Dict[str, np.ndarray], n_sims: int = 2000) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
     rows = []
     per_opp_samples = {}
 
@@ -201,14 +225,12 @@ def simulate_close_dates(opps: pd.DataFrame, stage_history: pd.DataFrame, stage_
     summary = pd.DataFrame(rows)
     return summary, per_opp_samples
 
-
 def prob_hit_target(close_samples_days: np.ndarray, target_date: pd.Timestamp) -> float:
     if target_date is None or pd.isna(target_date):
         return np.nan
     today = pd.Timestamp.today().normalize()
-    target_delta = (target_date.normalize() - today).days
+    target_delta = (pd.to_datetime(target_date).normalize() - today).days
     return float(np.mean(close_samples_days <= target_delta))
-
 
 # -------------------------
 # Plotting
@@ -220,7 +242,13 @@ def gantt_card(row: pd.Series) -> go.Figure:
     p50 = today + pd.Timedelta(days=float(row["days_p50"]))
     p90 = today + pd.Timedelta(days=float(row["days_p90"]))
 
-    fig.add_trace(go.Scatter(x=[p10, p90], y=[row["Name"], row["Name"]], mode="lines", line=dict(width=10), name="P10–P90"))
+    # P10–P90 window
+    fig.add_trace(go.Scatter(
+        x=[p10, p90], y=[row["Name"], row["Name"]],
+        mode="lines", line=dict(width=10), name="P10–P90"
+    ))
+
+    # Median marker (use safe literal for Plotly %{...} inside Python strings)
     fig.add_trace(go.Scatter(
         x=[p50, p50], y=[row["Name"], row["Name"]],
         mode="lines", line=dict(width=6, dash="dash"), name="Median",
@@ -229,13 +257,18 @@ def gantt_card(row: pd.Series) -> go.Figure:
 
     tgt = row.get("Target_CloseDate")
     if pd.notna(tgt):
-        fig.add_trace(go.Scatter(x=[tgt, tgt], y=[row["Name"], row["Name"]], mode="lines", line=dict(width=2, dash="dot"), name="Target"))
+        fig.add_trace(go.Scatter(
+            x=[tgt, tgt], y=[row["Name"], row["Name"]],
+            mode="lines", line=dict(width=2, dash="dot"), name="Target"
+        ))
 
-    fig.update_layout(height=140, margin=dict(l=20, r=20, t=20, b=20),
-                      yaxis=dict(title="", showticklabels=False),
-                      xaxis=dict(title="Date"), showlegend=True)
+    fig.update_layout(
+        height=140, margin=dict(l=20, r=20, t=20, b=20),
+        yaxis=dict(title="", showticklabels=False),
+        xaxis=dict(title="Date"),
+        showlegend=True
+    )
     return fig
-
 
 def portfolio_curve(sim_summary: pd.DataFrame, per_opp_samples: Dict[str, np.ndarray], opps: pd.DataFrame) -> go.Figure:
     today = pd.Timestamp.today().normalize()
@@ -263,11 +296,12 @@ def portfolio_curve(sim_summary: pd.DataFrame, per_opp_samples: Dict[str, np.nda
     fig.add_trace(go.Scatter(x=dates, y=p90, name="P90", mode="lines"))
     fig.add_trace(go.Scatter(x=dates, y=p50, name="P50", mode="lines"))
     fig.add_trace(go.Scatter(x=dates, y=p10, name="P10", mode="lines", fill="tonexty"))
-    fig.update_layout(height=360, margin=dict(l=20, r=20, t=40, b=40),
-                      xaxis_title="Date", yaxis_title="Cumulative Close ($)",
-                      legend_title="Percentiles")
+    fig.update_layout(
+        height=360, margin=dict(l=20, r=20, t=40, b=40),
+        xaxis_title="Date", yaxis_title="Cumulative Close ($)",
+        legend_title="Percentiles"
+    )
     return fig
-
 
 # -------------------------
 # UI
@@ -279,8 +313,14 @@ def main():
 
     with st.sidebar:
         st.header("Inputs")
-        opp_file = st.file_uploader("opportunities.csv", type=["csv"], help="Export with OpportunityId, Name, Amount, CloseDate, StageName/CurrentStage")
-        sh_file = st.file_uploader("stage_history.csv", type=["csv"], help="Export with OpportunityId, FromStage, ToStage, and ChangeDate or Entered/Exited")
+        opp_file = st.file_uploader(
+            "opportunities.csv", type=["csv"],
+            help="Export with OpportunityId, Name, Amount, CloseDate, StageName/CurrentStage"
+        )
+        sh_file = st.file_uploader(
+            "stage_history.csv", type=["csv"],
+            help="Export with OpportunityId, FromStage, ToStage, and ChangeDate or Entered/Exited"
+        )
         cfg_file = st.file_uploader("config.yml (optional)", type=["yml", "yaml"])
         n_sims = st.number_input("Simulations", min_value=200, max_value=20000, value=4000, step=200)
         fallback_days = st.number_input("Fallback days for missing stage data", min_value=1.0, max_value=60.0, value=7.0, step=1.0)
@@ -289,9 +329,48 @@ def main():
         st.info("Upload opportunities and stage history to begin.")
         st.stop()
 
+    # --- Load + normalize + alias map ---
     opps = normalize_columns(coerce_dates(_read_csv(opp_file)))
-    sh = normalize_columns(coerce_dates(_read_csv(sh_file)))
+    sh   = normalize_columns(coerce_dates(_read_csv(sh_file)))
 
+    # Canonical -> aliases that might show up in Salesforce exports
+    oppty_aliases = {
+        "OpportunityId": ["opportunity id", "opportunity_id", "id"],
+        "Name": ["name", "opportunity name"],
+        "Amount": ["amount", "amount usd", "amount ($)"],
+        "CloseDate": ["close date", "closedate"],
+        "StageName": ["stage", "stage name", "current stage"],
+        "IsClosed": ["is closed", "closed"],
+        "IsWon": ["is won", "won"],
+        "CreatedDate": ["created date", "createddate"],
+    }
+    stage_aliases = {
+        "OpportunityId": ["opportunity id", "opportunity_id", "id"],
+        "FromStage": ["from stage", "from_stage", "prior stage"],
+        "ToStage": ["to stage", "to_stage", "new stage", "next stage"],
+        "ChangeDate": ["change date", "changedate", "date/time", "modified date"],
+        # optional alternates:
+        "EnteredDate": ["entered date", "entereddate", "start date", "startdate"],
+        "ExitedDate": ["exited date", "exiteddate", "end date", "enddate"],
+        "StageName": ["stage", "stage name"],
+        "StartDate": ["start date", "startdate"],
+        "EndDate": ["end date", "enddate"],
+    }
+
+    opps = rename_columns(opps, oppty_aliases)
+    sh   = rename_columns(sh, stage_aliases)
+
+    # Minimal required columns
+    missing_a = require_columns(opps, ["OpportunityId"], "opportunities.csv")
+    missing_b = require_columns(sh,   ["OpportunityId"], "stage_history.csv")
+    if missing_a or missing_b:
+        st.stop()
+
+    # Optional CloseDate parsing standardization if provided
+    if "CloseDate" in opps.columns:
+        opps["CloseDate"] = pd.to_datetime(opps["CloseDate"], errors="coerce")
+
+    # --- Config (stage order override) ---
     config = {}
     if cfg_file is not None:
         try:
@@ -299,17 +378,32 @@ def main():
         except Exception as e:
             st.warning(f"Failed to read config: {e}")
 
-    stage_order = config.get("stage_order") or infer_stage_order(sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage"}))
+    stage_order = config.get("stage_order") or infer_stage_order(
+        sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage"})
+    )
     if not stage_order:
-        st.error("Couldn't determine stage order. Provide config.yml or ensure stage_history has FromStage/ToStage and ChangeDate.")
+        st.error("Couldn't determine stage order. Provide config.yml with stage_order or ensure stage_history has FromStage/ToStage and ChangeDate.")
         st.stop()
 
     st.write("**Stage order:**", " → ".join(stage_order))
 
-    durations = compute_stage_durations(sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage", "Stage": "StageName"}))
+    # --- Build duration samplers ---
+    durations = compute_stage_durations(
+        sh.rename(columns={"From_Stage": "FromStage", "To_Stage": "ToStage", "Stage": "StageName"})
+    )
     samplers = build_empirical_samplers(durations)
+    if not samplers:
+        st.warning("No historical stage durations available; using fallback days for all stages.")
 
-    opps_open = opps[~opps.get("IsClosed", False).astype(bool)] if "IsClosed" in opps.columns else opps.copy()
+    # Open opp filter (if provided)
+    if "IsClosed" in opps.columns:
+        # Try robust boolean conversion
+        ic = opps["IsClosed"]
+        if ic.dtype == object:
+            opps["IsClosed"] = ic.astype(str).str.lower().isin(["true", "t", "1", "yes", "y"])
+        opps_open = opps[~opps["IsClosed"].astype(bool)].copy()
+    else:
+        opps_open = opps.copy()
 
     st.subheader("Simulation")
     sim_summary, per_opp_samples = simulate_close_dates(opps_open, sh, stage_order, samplers, int(n_sims))
@@ -318,19 +412,30 @@ def main():
         st.warning("No open opportunities or insufficient data to simulate.")
         st.stop()
 
-    st.dataframe(sim_summary[["OpportunityId", "Name", "Amount", "CurrentStage", "RemainingStages", "days_p10", "days_p50", "days_p90", "Target_CloseDate"]], use_container_width=True)
+    st.dataframe(
+        sim_summary[[
+            "OpportunityId","Name","Amount","CurrentStage","RemainingStages",
+            "days_p10","days_p50","days_p90","Target_CloseDate"
+        ]],
+        use_container_width=True
+    )
 
+    # Tabs
     tab1, tab2 = st.tabs(["Opportunity view", "Portfolio view"])
 
     with tab1:
-        sel = st.selectbox("Select opportunity", sim_summary["Name"] + " (" + sim_summary["OpportunityId"].astype(str) + ")")
+        sel = st.selectbox(
+            "Select opportunity",
+            sim_summary["Name"] + " (" + sim_summary["OpportunityId"].astype(str) + ")"
+        )
         chosen_id = sel.split("(")[-1].strip(")")
         row = sim_summary[sim_summary["OpportunityId"] == chosen_id].iloc[0]
+
         fig = gantt_card(row)
         st.plotly_chart(fig, use_container_width=True)
 
         target_dt = row.get("Target_CloseDate")
-        p_hit = prob_hit_target(per_opp_samples[chosen_id], target_dt) if chosen_id in per_opp_samples else np.nan
+        p_hit = prob_hit_target(per_opp_samples.get(chosen_id, np.array([])), target_dt)
         if pd.notna(target_dt):
             st.metric(label=f"Probability to hit target ({pd.to_datetime(target_dt).date()})", value=f"{p_hit*100:.1f}%")
         else:
@@ -350,7 +455,6 @@ def main():
             "n_durations": int(len(durations)),
             "stages_with_samples": sorted(list(samplers.keys())),
         })
-
 
 if __name__ == "__main__":
     main()
