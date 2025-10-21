@@ -24,7 +24,7 @@ def plot_opportunity_timeline(opp_row, bands_df, target_date, now_dt):
                 y=[yi, yi],
                 mode="lines",
                 name=f"{stage} median",
-                hovertemplate=f"<b>{stage}</b><br>Median: %{x|%Y-%m-%d %H:%M}<extra></extra>",
+                hovertemplate=f"<b>{stage}</b><br>Median: %{{x|%Y-%m-%d %H:%M}}<extra></extra>",
                 showlegend=False
             ))
 
