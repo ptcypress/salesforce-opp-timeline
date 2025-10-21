@@ -20,26 +20,46 @@ except Exception:
 # -------------------------
 # Caching + utilities
 # -------------------------
+
 @st.cache_data(show_spinner=False)
 def _read_csv(uploaded_file: io.BytesIO) -> pd.DataFrame:
-    """Read CSV/TSV with automatic delimiter detection."""
+    """Read CSV/TSV with delimiter + encoding fallbacks."""
     if uploaded_file is None:
         return pd.DataFrame()
-    # Reset pointer each read (Streamlit may reuse BytesIO)
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-    try:
-        # engine='python' + sep=None lets pandas sniff commas, tabs, semicolons, etc.
-        return pd.read_csv(uploaded_file, sep=None, engine="python")
-    except Exception:
-        # Fallback to standard comma
+
+    # Always rewind the buffer before each attempt
+    def rewind():
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
-        return pd.read_csv(uploaded_file)
+
+    # Attempts: (sep=None sniffs comma/tab/semicolon; engine='python' allows sep=None)
+    attempts = [
+        dict(sep=None, engine="python", encoding="utf-8"),       # normal UTF-8
+        dict(sep=None, engine="python", encoding="utf-8-sig"),   # BOM-prefixed UTF-8
+        dict(sep=None, engine="python", encoding="cp1252"),      # Windows Western
+        dict(sep=None, engine="python", encoding="latin-1"),     # ISO-8859-1 (very permissive)
+    ]
+
+    for kw in attempts:
+        rewind()
+        try:
+            return pd.read_csv(uploaded_file, **kw)
+        except Exception:
+            continue
+
+    # Last-ditch: decode bytes ignoring errors, then parse text
+    rewind()
+    try:
+        raw = uploaded_file.read()
+        text = raw.decode("utf-8", errors="ignore")
+        from io import StringIO
+        return pd.read_csv(StringIO(text), sep=None, engine="python")
+    except Exception as e:
+        st.error(f"Failed to read file — unsupported encoding/format. Details: {e}")
+        return pd.DataFrame()
+
 
 @st.cache_data(show_spinner=False)
 def _read_yaml(uploaded_file: io.BytesIO) -> Dict:
