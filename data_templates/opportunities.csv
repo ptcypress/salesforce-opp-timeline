@@ -1,1 +1,5 @@
+OpportunityId,OpportunityName,AccountName,Owner,StageName,Amount,Currency,Probability,CreatedDate,CloseDate,ProductFamily,Region,Type,ForecastCategory
+006xx00000A1B2C,Acme – Brush Belt Pilot,Acme Corp,Kris D.,DFM DFA,125000,USD,0.45,2025-07-02 09:14:00,2025-11-15 00:00:00,Brush Belt,Northeast,New Business,BestCase
+006xx00000A1B2D,Globex – XT16 Ramp,Globex LLC,Charlie P.,ECR Creation,320000,USD,0.35,2025-08-21 14:05:00,2026-01-31 00:00:00,XT16,Northeast,Existing Business,Pipeline
+006xx00000A1B2E,Initech – AngleOn™,Initech,Alex R.,Prototyping,58000,USD,0.25,2025-09-10 11:20:00,2025-12-20 00:00:00,AngleOn,Midwest,New Business,Pipeline
 
